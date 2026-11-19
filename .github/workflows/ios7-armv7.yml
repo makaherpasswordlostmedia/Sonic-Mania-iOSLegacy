@@ -198,16 +198,25 @@ jobs:
       - name: Pack .ipa
         run: |
           set -euo pipefail
-          APP="$(find .theos -type d -name SonicMania.app | head -n1)"
+          # the staged bundle (.theos/_/Applications) has Info.plist + signed binary; .theos/obj/... holds only the raw binary
+          APP="$(find .theos/_ -type d -name SonicMania.app | head -n1)"
+          [ -f "$APP/Info.plist" ] || { echo "::error::staged SonicMania.app with Info.plist not found"; find .theos -maxdepth 6 | head -50; exit 1; }
           [ -n "$APP" ] || { echo "::error::SonicMania.app not found"; exit 1; }
           mkdir -p ipa/Payload packages && cp -a "$APP" ipa/Payload/
           (cd ipa && zip -rq ../packages/SonicMania-armv7-ios7.ipa Payload)
       - name: Check Mach-O is armv7
         run: |
-          BIN="$(find .theos -type f -name SonicMania | head -n1)"; file "$BIN"
+          BIN="$(find .theos/_ -type f -name SonicMania | head -n1)"; file "$BIN"
           file "$BIN" | grep -qi "armv7" || { echo "::error::not an armv7 binary"; exit 1; }
+      - name: Inspect package (signature, plist, layout)
+        run: |
+          APP="$(find .theos/_ -type d -name SonicMania.app | head -n1)"
+          ls -la "$APP"; cat "$APP/Info.plist" | head -40
+          BIN="$APP/SonicMania"; file "$BIN"
+          which ldid && ldid -e "$BIN" | head -5 || echo "no ldid on runner"
+          unzip -l packages/SonicMania-armv7-ios7.ipa | head -20; ls -la packages
       - uses: actions/upload-artifact@v4
-        with: { name: SonicMania-armv7-ios7, path: "packages/*.ipa", if-no-files-found: error }
+        with: { name: SonicMania-armv7-ios7, path: "packages/*", if-no-files-found: error }
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: build-log, path: build.log, if-no-files-found: ignore }
