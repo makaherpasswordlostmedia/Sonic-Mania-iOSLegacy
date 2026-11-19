@@ -1,0 +1,967 @@
+name: Build Sonic Mania (iOS 7, armv7)
+# SINGLE-FILE PORT: put only this file at .github/workflows/ios7-armv7.yml in your Sonic-Mania-PSP fork
+# (next to SonicManiaDecomp/), push, then Actions -> "Build Sonic Mania (iOS 7, armv7)" -> Run workflow.
+# It writes all port sources itself, patches the engine, builds with Theos. The .ipa contains NO game data.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host tools
+        run: sudo apt-get update && sudo apt-get install -y build-essential perl curl ca-certificates zip unzip xz-utils bzip2 git fakeroot make python3
+      - name: Write port files
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname 'ios/IOSBridge.h')"
+          cat > 'ios/IOSBridge.h' <<'EOF_SMPORT'
+          // IOSBridge.h - plain C ABI between the RSDKv5 engine (C++) and the UIKit/GLES/AudioQueue host (IOSBridge.mm).
+          // iOS 7.0+, armv7. No SDL.
+          #ifndef IOS_BRIDGE_H
+          #define IOS_BRIDGE_H
+
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+
+          // ---- GL (EAGLContext + CAEAGLLayer, GLES2) ----
+          // Blocks until the UIKit view exists, then creates (or re-binds) the context + framebuffer. Call from the engine thread.
+          int  ios_gl_create(void);
+          void ios_gl_present(void);
+          void ios_gl_destroy(void);
+          void ios_gl_size(int *w, int *h); // drawable size in pixels
+
+          // ---- app lifecycle (GL calls in the background kill the app on iOS) ----
+          int  ios_is_active(void);
+          void ios_ack_paused(void); // engine calls this after glFinish() once it saw !ios_is_active()
+
+          // ---- touch ----
+          // Fills up to maxn active touches, coords normalised 0..1 (x across the landscape width, y down the height).
+          int  ios_touch_snapshot(float *x, float *y, int maxn);
+
+          // ---- audio (AudioQueue, float32 interleaved) ----
+          typedef void (*ios_audio_cb)(void *stream, int bytes);
+          int  ios_audio_start(ios_audio_cb cb, int freq, int channels, int bytesPerBuffer);
+          void ios_audio_stop(void);
+          void ios_audio_lock(void);
+          void ios_audio_unlock(void);
+
+          // ---- on-screen pad layout, shared by the overlay drawing and the hit-testing ----
+          // cx/cy: centre, normalised to the screen width/height. r: radius, normalised to the screen HEIGHT.
+          typedef struct { float cx, cy, r; int mask; const char *label; } IOSPadButton;
+          #define IOS_PAD_BUTTON_COUNT 6
+          static const IOSPadButton ios_pad_buttons[IOS_PAD_BUTTON_COUNT] = {
+              { 0.90f, 0.78f, 0.13f, 1 << 12, "A" },  // KEYMASK_A (jump)
+              { 0.78f, 0.88f, 0.10f, 1 << 13, "B" },  // KEYMASK_B
+              { 0.78f, 0.62f, 0.10f, 1 << 14, "X" },  // KEYMASK_X
+              { 0.66f, 0.80f, 0.08f, 1 << 15, "Y" },  // KEYMASK_Y
+              { 0.57f, 0.92f, 0.06f, 1 << 4,  "ST" }, // KEYMASK_START
+              { 0.43f, 0.92f, 0.06f, 1 << 5,  "SE" }, // KEYMASK_SELECT
+          };
+          #define IOS_DPAD_CX 0.16f
+          #define IOS_DPAD_CY 0.72f
+          #define IOS_DPAD_R  0.24f // radius, normalised to height
+
+          #ifdef __cplusplus
+          }
+          #endif
+          #endif
+          EOF_SMPORT
+          mkdir -p "$(dirname 'ios/IOSBridge.mm')"
+          cat > 'ios/IOSBridge.mm' <<'EOF_SMPORT'
+          // IOSBridge.mm - UIKit host for the RSDKv5 engine on iOS 7 / armv7 (Theos, iPhoneOS9.3 SDK, no ARC assumptions).
+          #import <UIKit/UIKit.h>
+          #import <OpenGLES/EAGL.h>
+          #import <OpenGLES/EAGLDrawable.h>
+          #import <OpenGLES/ES2/gl.h>
+          #import <OpenGLES/ES2/glext.h>
+          #import <AudioToolbox/AudioToolbox.h>
+          #import <AVFoundation/AVFoundation.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <dispatch/dispatch.h>
+          #include "IOSBridge.h"
+
+          extern "C" int ios_engine_entry(int argc, char **argv); // main.cpp (RETRO_iOS branch)
+
+          static dispatch_semaphore_t gViewReady;
+          static dispatch_semaphore_t gPausedAck;
+          static volatile int gActive = 1;
+
+          // ------------------------------------------------------------------ touches
+          static pthread_mutex_t gTouchLock = PTHREAD_MUTEX_INITIALIZER;
+          static float gTx[16], gTy[16];
+          static int   gTn = 0;
+
+          int ios_touch_snapshot(float *x, float *y, int maxn)
+          {
+              pthread_mutex_lock(&gTouchLock);
+              int n = gTn < maxn ? gTn : maxn;
+              for (int i = 0; i < n; ++i) { x[i] = gTx[i]; y[i] = gTy[i]; }
+              pthread_mutex_unlock(&gTouchLock);
+              return n;
+          }
+
+          // ------------------------------------------------------------------ views
+          @interface RSDKPadOverlay : UIView
+          @end
+          @implementation RSDKPadOverlay
+          - (id)initWithFrame:(CGRect)f { if ((self = [super initWithFrame:f])) { self.userInteractionEnabled = NO; self.opaque = NO; self.backgroundColor = [UIColor clearColor]; } return self; }
+          - (void)drawRect:(CGRect)rect
+          {
+              CGContextRef c = UIGraphicsGetCurrentContext();
+              float w = self.bounds.size.width, h = self.bounds.size.height;
+              CGContextSetRGBStrokeColor(c, 1, 1, 1, 0.45);
+              CGContextSetRGBFillColor(c, 1, 1, 1, 0.12);
+              CGContextSetLineWidth(c, 2);
+              float dr = IOS_DPAD_R * h;
+              CGRect d = CGRectMake(IOS_DPAD_CX * w - dr, IOS_DPAD_CY * h - dr, dr * 2, dr * 2);
+              CGContextFillEllipseInRect(c, d); CGContextStrokeEllipseInRect(c, d);
+              UIFont *f = [UIFont boldSystemFontOfSize:h * 0.045];
+              [[UIColor colorWithWhite:1 alpha:0.6] set];
+              for (int i = 0; i < IOS_PAD_BUTTON_COUNT; ++i) {
+                  const IOSPadButton *b = &ios_pad_buttons[i];
+                  if (!b->mask) continue;
+                  float r = b->r * h;
+                  CGRect br = CGRectMake(b->cx * w - r, b->cy * h - r, r * 2, r * 2);
+                  CGContextSetRGBStrokeColor(c, 1, 1, 1, 0.45); CGContextSetRGBFillColor(c, 1, 1, 1, 0.12);
+                  CGContextFillEllipseInRect(c, br); CGContextStrokeEllipseInRect(c, br);
+                  [[UIColor colorWithWhite:1 alpha:0.6] set];
+                  NSString *s = [NSString stringWithUTF8String:b->label];
+                  CGSize sz = [s sizeWithFont:f];
+                  [s drawAtPoint:CGPointMake(br.origin.x + (br.size.width - sz.width) / 2, br.origin.y + (br.size.height - sz.height) / 2) withFont:f];
+              }
+          }
+          @end
+
+          @interface RSDKGLView : UIView
+          @end
+          @implementation RSDKGLView
+          + (Class)layerClass { return [CAEAGLLayer class]; }
+          - (void)updateTouches:(UIEvent *)event
+          {
+              pthread_mutex_lock(&gTouchLock);
+              gTn = 0;
+              CGSize s = self.bounds.size;
+              for (UITouch *t in [event touchesForView:self]) {
+                  if (t.phase == UITouchPhaseEnded || t.phase == UITouchPhaseCancelled || gTn >= 16) continue;
+                  CGPoint p = [t locationInView:self];
+                  gTx[gTn] = p.x / s.width; gTy[gTn] = p.y / s.height; ++gTn;
+              }
+              pthread_mutex_unlock(&gTouchLock);
+          }
+          - (void)touchesBegan:(NSSet *)t withEvent:(UIEvent *)e     { [self updateTouches:e]; }
+          - (void)touchesMoved:(NSSet *)t withEvent:(UIEvent *)e     { [self updateTouches:e]; }
+          - (void)touchesEnded:(NSSet *)t withEvent:(UIEvent *)e     { [self updateTouches:e]; }
+          - (void)touchesCancelled:(NSSet *)t withEvent:(UIEvent *)e { [self updateTouches:e]; }
+          @end
+
+          static RSDKGLView *gView;
+
+          @interface RSDKViewController : UIViewController
+          @end
+          @implementation RSDKViewController
+          - (void)loadView
+          {
+              CGRect b = [UIScreen mainScreen].bounds;
+              if (b.size.width < b.size.height) b = CGRectMake(0, 0, b.size.height, b.size.width); // iOS 7: bounds are portrait
+              RSDKGLView *v = [[RSDKGLView alloc] initWithFrame:b];
+              v.multipleTouchEnabled = YES;
+              v.opaque = YES;
+              v.contentScaleFactor = [UIScreen mainScreen].scale;
+              CAEAGLLayer *l = (CAEAGLLayer *)v.layer;
+              l.opaque = YES;
+              l.drawableProperties = @{ kEAGLDrawablePropertyRetainedBacking : @NO, kEAGLDrawablePropertyColorFormat : kEAGLColorFormatRGBA8 };
+              RSDKPadOverlay *o = [[RSDKPadOverlay alloc] initWithFrame:b];
+              o.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+              [v addSubview:o];
+              self.view = v;
+              gView = v;
+          }
+          - (BOOL)prefersStatusBarHidden { return YES; }
+          - (BOOL)shouldAutorotate { return YES; }
+          - (NSUInteger)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+          - (void)viewDidAppear:(BOOL)animated { [super viewDidAppear:animated]; dispatch_semaphore_signal(gViewReady); }
+          @end
+
+          // ------------------------------------------------------------------ GL
+          static EAGLContext *gCtx;
+          static GLuint gFbo, gRbo;
+          static int gW, gH;
+
+          int ios_gl_create(void)
+          {
+              static int viewWaited = 0;
+              if (!viewWaited) { dispatch_semaphore_wait(gViewReady, DISPATCH_TIME_FOREVER); viewWaited = 1; }
+              if (!gCtx) gCtx = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+              if (!gCtx || ![EAGLContext setCurrentContext:gCtx]) return 0;
+              glGenFramebuffers(1, &gFbo);
+              glGenRenderbuffers(1, &gRbo);
+              glBindFramebuffer(GL_FRAMEBUFFER, gFbo);
+              glBindRenderbuffer(GL_RENDERBUFFER, gRbo);
+              if (![gCtx renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer *)gView.layer]) return 0;
+              glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, gRbo);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &gW);
+              glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &gH);
+              return glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+          }
+
+          void ios_gl_present(void)
+          {
+              glBindRenderbuffer(GL_RENDERBUFFER, gRbo);
+              [gCtx presentRenderbuffer:GL_RENDERBUFFER];
+          }
+
+          void ios_gl_destroy(void)
+          {
+              if (gFbo) glDeleteFramebuffers(1, &gFbo);
+              if (gRbo) glDeleteRenderbuffers(1, &gRbo);
+              gFbo = gRbo = 0;
+          }
+
+          void ios_gl_size(int *w, int *h) { if (w) *w = gW; if (h) *h = gH; }
+
+          int  ios_is_active(void) { return gActive; }
+          void ios_ack_paused(void) { dispatch_semaphore_signal(gPausedAck); }
+
+          // ------------------------------------------------------------------ audio
+          static AudioQueueRef gQueue;
+          static AudioQueueBufferRef gBufs[3];
+          static ios_audio_cb gCb;
+          static pthread_mutex_t gAudioLock;
+          static int gBytes;
+
+          static void AQCallback(void *ud, AudioQueueRef q, AudioQueueBufferRef buf)
+          {
+              pthread_mutex_lock(&gAudioLock);
+              gCb(buf->mAudioData, gBytes);
+              pthread_mutex_unlock(&gAudioLock);
+              buf->mAudioDataByteSize = gBytes;
+              AudioQueueEnqueueBuffer(q, buf, 0, NULL);
+          }
+
+          int ios_audio_start(ios_audio_cb cb, int freq, int channels, int bytesPerBuffer)
+          {
+              pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE);
+              pthread_mutex_init(&gAudioLock, &a);
+              gCb = cb; gBytes = bytesPerBuffer;
+              AVAudioSession *s = [AVAudioSession sharedInstance];
+              [s setCategory:AVAudioSessionCategoryAmbient error:nil];
+              [s setActive:YES error:nil];
+
+              AudioStreamBasicDescription f = {};
+              f.mSampleRate = freq; f.mFormatID = kAudioFormatLinearPCM;
+              f.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
+              f.mChannelsPerFrame = channels; f.mBitsPerChannel = 32;
+              f.mBytesPerFrame = channels * 4; f.mFramesPerPacket = 1; f.mBytesPerPacket = f.mBytesPerFrame;
+              if (AudioQueueNewOutput(&f, AQCallback, NULL, NULL, NULL, 0, &gQueue) != noErr) return 0;
+              for (int i = 0; i < 3; ++i) {
+                  AudioQueueAllocateBuffer(gQueue, bytesPerBuffer, &gBufs[i]);
+                  memset(gBufs[i]->mAudioData, 0, bytesPerBuffer);
+                  gBufs[i]->mAudioDataByteSize = bytesPerBuffer;
+                  AudioQueueEnqueueBuffer(gQueue, gBufs[i], 0, NULL);
+              }
+              return AudioQueueStart(gQueue, NULL) == noErr;
+          }
+
+          void ios_audio_stop(void)
+          {
+              if (gQueue) { AudioQueueStop(gQueue, true); AudioQueueDispose(gQueue, true); gQueue = NULL; }
+          }
+          void ios_audio_lock(void)   { pthread_mutex_lock(&gAudioLock); }
+          void ios_audio_unlock(void) { pthread_mutex_unlock(&gAudioLock); }
+
+          // ------------------------------------------------------------------ app
+          static void *EngineThread(void *)
+          {
+              NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) objectAtIndex:0];
+              chdir([docs fileSystemRepresentation]); // Data.rsdk (+ Settings.ini, saves) live in Documents (iTunes file sharing)
+              char arg0[] = "SonicMania";
+              char *argv[] = { arg0, NULL };
+              ios_engine_entry(1, argv);
+              exit(0);
+              return NULL;
+          }
+
+          @interface RSDKAppDelegate : UIResponder <UIApplicationDelegate>
+          @property (strong, nonatomic) UIWindow *window;
+          @end
+          @implementation RSDKAppDelegate
+          - (BOOL)application:(UIApplication *)app didFinishLaunchingWithOptions:(NSDictionary *)opts
+          {
+              gViewReady = dispatch_semaphore_create(0);
+              gPausedAck = dispatch_semaphore_create(0);
+              self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+              self.window.rootViewController = [[RSDKViewController alloc] init];
+              [self.window makeKeyAndVisible];
+              [app setStatusBarHidden:YES];
+              [app setIdleTimerDisabled:YES];
+
+              pthread_attr_t at; pthread_attr_init(&at);
+              pthread_attr_setstacksize(&at, 8 * 1024 * 1024); // the engine + game logic use a lot of stack
+              pthread_t th; pthread_create(&th, &at, EngineThread, NULL);
+              return YES;
+          }
+          - (void)applicationWillResignActive:(UIApplication *)app
+          {
+              gActive = 0;
+              if (gQueue) AudioQueuePause(gQueue);
+              dispatch_semaphore_wait(gPausedAck, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)); // engine flushes GL first
+          }
+          - (void)applicationDidBecomeActive:(UIApplication *)app
+          {
+              gActive = 1;
+              if (gQueue) AudioQueueStart(gQueue, NULL);
+          }
+          @end
+
+          int main(int argc, char *argv[])
+          {
+              @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([RSDKAppDelegate class])); }
+          }
+          EOF_SMPORT
+          mkdir -p "$(dirname 'engine/Graphics/IOS/IOSRenderDevice.hpp')"
+          cat > 'engine/Graphics/IOS/IOSRenderDevice.hpp' <<'EOF_SMPORT'
+          // GLES2 render device for iOS (EAGLContext/CAEAGLLayer through ios/IOSBridge). Derived from the EGL device.
+          #include <OpenGLES/ES2/gl.h>
+          #include <OpenGLES/ES2/glext.h>
+          #include "IOSBridge.h"
+
+          namespace RSDK
+          {
+          class RenderDevice : public RenderDeviceBase
+          {
+          public:
+              struct WindowInfo {
+                  typedef struct {
+                      uint32 width;
+                      uint32 height;
+                      uint32 refresh_rate;
+                  } BasicWindowInfo;
+                  union {
+                      struct {
+                          uint32 width;
+                          uint32 height;
+                          uint32 refresh_rate;
+                      };
+                      BasicWindowInfo internal;
+                  } * displays;
+              };
+
+              static WindowInfo displayInfo;
+
+              static bool Init();
+              static void CopyFrameBuffer();
+              static void FlipScreen();
+              static void Release(bool32 isRefresh);
+
+              static void RefreshWindow();
+              static void GetWindowSize(int32 *width, int32 *height);
+
+              static void SetupImageTexture(int32 width, int32 height, uint8 *imagePixels);
+              static void SetupVideoTexture_YUV420(int32 width, int32 height, uint8 *yPlane, uint8 *uPlane, uint8 *vPlane, int32 strideY, int32 strideU,
+                                                   int32 strideV);
+              static void SetupVideoTexture_YUV422(int32 width, int32 height, uint8 *yPlane, uint8 *uPlane, uint8 *vPlane, int32 strideY, int32 strideU,
+                                                   int32 strideV);
+              static void SetupVideoTexture_YUV444(int32 width, int32 height, uint8 *yPlane, uint8 *uPlane, uint8 *vPlane, int32 strideY, int32 strideU,
+                                                   int32 strideV);
+
+              static bool ProcessEvents();
+
+              static void InitFPSCap();
+              static bool CheckFPSCap();
+              static void UpdateFPSCap();
+
+              static bool InitShaders();
+              static void LoadShader(const char *fileName, bool32 linear);
+
+              static inline void ShowCursor(bool32 shown) {}
+              static inline bool GetCursorPos(Vector2 *pos) { return false; }
+              static inline void SetWindowTitle() {}
+
+              static GLuint screenTextures[SCREEN_COUNT];
+              static GLuint imageTexture;
+
+              static bool32 isInitialized;
+
+          private:
+              static bool SetupRendering();
+              static void InitVertexBuffer();
+              static bool InitGraphicsAPI();
+
+              static void GetDisplays();
+
+              static void SetLinear(bool32 linear);
+
+              static int32 monitorIndex;
+
+              static GLuint VAO;
+              static GLuint VBO;
+
+              static uint32 *videoBuffer;
+          };
+
+          struct ShaderEntry : public ShaderEntryBase {
+              GLuint programID;
+          };
+          } // namespace RSDK
+          EOF_SMPORT
+          mkdir -p "$(dirname 'engine/Audio/IOS/IOSAudioDevice.hpp')"
+          cat > 'engine/Audio/IOS/IOSAudioDevice.hpp' <<'EOF_SMPORT'
+          #include "IOSBridge.h"
+          #define LockAudioDevice()   ios_audio_lock()
+          #define UnlockAudioDevice() ios_audio_unlock()
+
+          namespace RSDK
+          {
+          class AudioDevice : public AudioDeviceBase
+          {
+          public:
+              static bool32 Init();
+              static void Release();
+
+              static void FrameInit() {}
+
+              // decode the first chunk inline; the rest is streamed by the mixer (no extra thread on a 512MB device)
+              inline static void HandleStreamLoad(ChannelInfo *channel, bool32 async) { LoadStream(channel); }
+
+          private:
+              static uint8 contextInitialized;
+
+              static void InitAudioChannels();
+              static void AudioCallback(void *stream, int bytes);
+          };
+          } // namespace RSDK
+          EOF_SMPORT
+          mkdir -p "$(dirname 'engine/Audio/IOS/IOSAudioDevice.cpp')"
+          cat > 'engine/Audio/IOS/IOSAudioDevice.cpp' <<'EOF_SMPORT'
+          uint8 AudioDevice::contextInitialized;
+
+          bool32 AudioDevice::Init()
+          {
+              if (!contextInitialized) {
+                  contextInitialized = true;
+                  InitAudioChannels();
+              }
+
+              audioState = false;
+              if (ios_audio_start(AudioCallback, AUDIO_FREQUENCY, AUDIO_CHANNELS, MIX_BUFFER_SIZE * sizeof(SAMPLE_FORMAT)))
+                  audioState = true;
+              else
+                  PrintLog(PRINT_NORMAL, "ERROR: Unable to open audio device!");
+
+              return true;
+          }
+
+          void AudioDevice::Release()
+          {
+              ios_audio_stop();
+
+              LockAudioDevice();
+              AudioDeviceBase::Release();
+              UnlockAudioDevice();
+          }
+
+          void AudioDevice::InitAudioChannels() { AudioDeviceBase::InitAudioChannels(); }
+
+          void AudioDevice::AudioCallback(void *stream, int bytes) { AudioDevice::ProcessAudioMixing(stream, bytes / sizeof(SAMPLE_FORMAT)); }
+          EOF_SMPORT
+          mkdir -p "$(dirname 'engine/Input/IOS/IOSInputDevice.hpp')"
+          cat > 'engine/Input/IOS/IOSInputDevice.hpp' <<'EOF_SMPORT'
+          #include "IOSBridge.h"
+          namespace SKU
+          {
+
+          struct InputDeviceIOS : InputDevice {
+              void UpdateInput();
+              void ProcessInput(int32 controllerID);
+              void CloseDevice();
+
+              int32 buttonMasks;
+              int32 prevButtonMasks;
+              uint8 stateUp, stateDown, stateLeft, stateRight;
+              uint8 stateA, stateB, stateC, stateX, stateY, stateZ;
+              uint8 stateStart, stateSelect;
+              uint8 stateBumper_L, stateBumper_R;
+              float bumperDeltaL, bumperDeltaR;
+              float hDelta_L, vDelta_L;
+          };
+
+          InputDeviceIOS *InitIOSInputDevice(uint32 id);
+
+          void InitIOSInputAPI();
+
+          } // namespace SKU
+          EOF_SMPORT
+          mkdir -p "$(dirname 'engine/Input/IOS/IOSInputDevice.cpp')"
+          cat > 'engine/Input/IOS/IOSInputDevice.cpp' <<'EOF_SMPORT'
+          // On-screen d-pad + buttons (layout shared with the overlay in ios/IOSBridge.h). Hit-testing only: the overlay is drawn by UIKit.
+          #include <math.h>
+
+          void RSDK::SKU::InputDeviceIOS::UpdateInput()
+          {
+              int32 masks = 0;
+              float tx[16], ty[16];
+              int n = ios_touch_snapshot(tx, ty, 16);
+
+              int gw = 0, gh = 0;
+              RenderDevice::GetWindowSize(&gw, &gh);
+              if (gw <= 0 || gh <= 0) {
+                  gw = 480;
+                  gh = 320;
+              }
+              float aspect = (float)gw / (float)gh;
+
+              for (int i = 0; i < n; ++i) {
+                  // everything in "height units": x scaled by the aspect ratio
+                  float px = tx[i] * aspect, py = ty[i];
+
+                  float dx = px - IOS_DPAD_CX * aspect, dy = py - IOS_DPAD_CY;
+                  float dist = sqrtf(dx * dx + dy * dy);
+                  if (dist < IOS_DPAD_R * 1.25f && dist > IOS_DPAD_R * 0.12f) {
+                      if (dx < -dist * 0.38f) masks |= KEYMASK_LEFT;
+                      if (dx > dist * 0.38f) masks |= KEYMASK_RIGHT;
+                      if (dy < -dist * 0.38f) masks |= KEYMASK_UP;
+                      if (dy > dist * 0.38f) masks |= KEYMASK_DOWN;
+                  }
+
+                  for (int b = 0; b < IOS_PAD_BUTTON_COUNT; ++b) {
+                      const IOSPadButton *btn = &ios_pad_buttons[b];
+                      float bx = px - btn->cx * aspect, by = py - btn->cy;
+                      if (sqrtf(bx * bx + by * by) < btn->r * 1.2f) // a little forgiving: thumbs are bigger than circles
+                          masks |= btn->mask;
+                  }
+              }
+
+              prevButtonMasks = buttonMasks;
+              buttonMasks     = masks;
+
+              int32 changedButtons = ~prevButtonMasks & (prevButtonMasks ^ buttonMasks);
+              if (changedButtons) {
+                  this->inactiveTimer[0] = 0;
+                  this->anyPress         = true;
+              }
+              else {
+                  ++this->inactiveTimer[0];
+                  this->anyPress = false;
+              }
+              if ((changedButtons & KEYMASK_A) || (changedButtons & KEYMASK_START))
+                  this->inactiveTimer[1] = 0;
+              else
+                  ++this->inactiveTimer[1];
+
+              stateUp       = (masks & KEYMASK_UP) != 0;
+              stateDown     = (masks & KEYMASK_DOWN) != 0;
+              stateLeft     = (masks & KEYMASK_LEFT) != 0;
+              stateRight    = (masks & KEYMASK_RIGHT) != 0;
+              stateA        = (masks & KEYMASK_A) != 0;
+              stateB        = (masks & KEYMASK_B) != 0;
+              stateC        = (masks & KEYMASK_C) != 0;
+              stateX        = (masks & KEYMASK_X) != 0;
+              stateY        = (masks & KEYMASK_Y) != 0;
+              stateZ        = (masks & KEYMASK_Z) != 0;
+              stateStart    = (masks & KEYMASK_START) != 0;
+              stateSelect   = (masks & KEYMASK_SELECT) != 0;
+              stateBumper_L = stateBumper_R = 0;
+              hDelta_L = vDelta_L = 0.0f;
+
+              ProcessInput(CONT_ANY);
+          }
+
+          void RSDK::SKU::InputDeviceIOS::ProcessInput(int32 controllerID)
+          {
+              controller[controllerID].keyUp.press |= this->stateUp;
+              controller[controllerID].keyDown.press |= this->stateDown;
+              controller[controllerID].keyLeft.press |= this->stateLeft;
+              controller[controllerID].keyRight.press |= this->stateRight;
+              controller[controllerID].keyA.press |= this->stateA;
+              controller[controllerID].keyB.press |= this->stateB;
+              controller[controllerID].keyC.press |= this->stateC;
+              controller[controllerID].keyX.press |= this->stateX;
+              controller[controllerID].keyY.press |= this->stateY;
+              controller[controllerID].keyZ.press |= this->stateZ;
+              controller[controllerID].keyStart.press |= this->stateStart;
+              controller[controllerID].keySelect.press |= this->stateSelect;
+
+          #if RETRO_REV02
+              stickL[controllerID].keyStick.press |= false;
+              stickL[controllerID].hDelta = this->hDelta_L;
+              stickL[controllerID].vDelta = this->vDelta_L;
+              triggerL[controllerID].keyBumper.press |= this->stateBumper_L;
+              triggerL[controllerID].bumperDelta = this->bumperDeltaL;
+              triggerR[controllerID].keyBumper.press |= this->stateBumper_R;
+              triggerR[controllerID].bumperDelta = this->bumperDeltaR;
+          #else
+              stickL[controllerID].hDeltaL = this->hDelta_L;
+              stickL[controllerID].vDeltaL = this->vDelta_L;
+              controller[controllerID].keyBumperL.press |= this->stateBumper_L;
+              controller[controllerID].keyBumperR.press |= this->stateBumper_R;
+          #endif
+          }
+
+          void RSDK::SKU::InputDeviceIOS::CloseDevice()
+          {
+              this->active     = false;
+              this->isAssigned = false;
+          }
+
+          RSDK::SKU::InputDeviceIOS *RSDK::SKU::InitIOSInputDevice(uint32 id)
+          {
+              if (inputDeviceCount >= INPUTDEVICE_COUNT)
+                  return NULL;
+
+              if (inputDeviceList[inputDeviceCount] && inputDeviceList[inputDeviceCount]->active)
+                  return NULL;
+
+              if (inputDeviceList[inputDeviceCount])
+                  delete inputDeviceList[inputDeviceCount];
+
+              inputDeviceList[inputDeviceCount] = new InputDeviceIOS();
+
+              InputDeviceIOS *device = (InputDeviceIOS *)inputDeviceList[inputDeviceCount];
+
+              device->active     = true;
+              device->disabled   = false;
+              device->isAssigned = false;
+              device->unused     = 0;
+              device->gamepadType = (DEVICE_API_NONE << 16) | (DEVICE_TYPE_CONTROLLER << 8) | (DEVICE_XBOX << 0);
+              device->id          = id;
+              device->buttonMasks = device->prevButtonMasks = 0;
+              device->stateUp = device->stateDown = device->stateLeft = device->stateRight = 0;
+              device->stateA = device->stateB = device->stateC = device->stateX = 0;
+              device->stateY = device->stateZ = device->stateStart = device->stateSelect = 0;
+              device->stateBumper_L = device->stateBumper_R = 0;
+              device->bumperDeltaL = device->bumperDeltaR = 0.0f;
+              device->hDelta_L = device->vDelta_L = 0.0f;
+              device->anyPress = false;
+              device->inactiveTimer[0] = device->inactiveTimer[1] = 0;
+
+              for (int32 i = 0; i < PLAYER_COUNT; ++i) {
+                  if (inputSlots[i] == id) {
+                      inputSlotDevices[i] = device;
+                      device->isAssigned  = true;
+                  }
+              }
+
+              inputDeviceCount++;
+              return device;
+          }
+
+          void RSDK::SKU::InitIOSInputAPI() { InitIOSInputDevice(0x01); } // the touch pad is always there
+          EOF_SMPORT
+          mkdir -p "$(dirname 'tools/apply_ios_port.py')"
+          cat > 'tools/apply_ios_port.py' <<'EOF_SMPORT'
+          #!/usr/bin/env python3
+          """
+          apply_ios_port.py - turns the Sonic-Mania-PSP tree into an iOS 7 / armv7 (Theos) build tree.
+          Run from the repo root (the folder that contains SonicManiaDecomp/ and psp/):   python3 tools/apply_ios_port.py
+          Idempotent: running it twice changes nothing the second time.
+          What it does:
+            1. copies engine/{Graphics,Audio,Input}/IOS/* into RSDKv5/RSDK/...
+            2. generates RSDK/Graphics/IOS/IOSRenderDevice.cpp from the EGL (GLES2) device, swapping EGL for EAGL (ios/IOSBridge)
+            3. adds the RETRO_*_IOS switches and include hooks to the engine, and the iOS entry point to main.cpp
+          """
+          import os, re, shutil, sys
+
+          HERE = os.path.dirname(os.path.abspath(__file__))
+          PKG  = os.path.dirname(HERE)                       # folder holding engine/ and ios/
+          ROOT = os.getcwd()
+          ENG  = os.path.join(ROOT, "SonicManiaDecomp/dependencies/RSDKv5/RSDKv5")
+          RSDK = os.path.join(ENG, "RSDK")
+
+          def die(msg):
+              print("ERROR:", msg); sys.exit(1)
+
+          def rd(p):
+              with open(p, encoding="utf-8", newline="") as f: return f.read()
+
+          def wr(p, s):
+              with open(p, "w", encoding="utf-8", newline="") as f: f.write(s)
+
+          def sub_once(s, old, new, what, marker=None):
+              """replace exactly one occurrence; skip silently if the marker (already applied) is present"""
+              if marker and marker in s: return s
+              if s.count(old) != 1: die("patch anchor not found exactly once: " + what)
+              return s.replace(old, new)
+
+          if not os.path.isdir(ENG): die("run this from the repo root (SonicManiaDecomp/ not found)")
+
+          # ---------------------------------------------------------------- 1. copy sources
+          for sub in ("Graphics", "Audio", "Input"):
+              src = os.path.join(PKG, "engine", sub, "IOS")
+              dst = os.path.join(RSDK, sub, "IOS")
+              os.makedirs(dst, exist_ok=True)
+              for f in os.listdir(src): shutil.copy(os.path.join(src, f), os.path.join(dst, f))
+          if os.path.abspath(PKG) != os.path.abspath(ROOT):
+              shutil.copytree(os.path.join(PKG, "ios"), os.path.join(ROOT, "ios"), dirs_exist_ok=True)
+
+          # ---------------------------------------------------------------- 2. IOSRenderDevice.cpp from the EGL device
+          s = rd(os.path.join(RSDK, "Graphics/EGL/EGLRenderDevice.cpp"))
+
+          # window/EGL statics
+          a = s.index("EGLDisplay RenderDevice::display;")
+          b = s.index("GLuint RenderDevice::VAO;")
+          s = s[:a] + s[b:]
+
+          # shader preamble: use the GLES2 (Android) variant
+          s = sub_once(s, "#if RETRO_PLATFORM == RETRO_SWITCH\n#define _GLVERSION", "#if 0\n#define _GLVERSION", "glversion switch")
+          s = sub_once(s, "#elif RETRO_PLATFORM == RETRO_ANDROID\n#define _GLVERSION", "#else\n#define _GLVERSION", "glversion android")
+          s = sub_once(s, "#define GL_BGRA                     GL_RGBA", "#define GL_BGRA                     GL_BGRA_EXT", "bgra")
+
+          # Init() + the EGL part of SetupRendering() -> EAGL
+          a = s.index("bool RenderDevice::Init()")
+          b = s.index("\n    GetDisplays();\n", a)
+          s = s[:a] + '''bool RenderDevice::Init()
+          {
+              if (!SetupRendering())
+                  return false;
+              if (!isRunning) {
+                  if (!AudioDevice::Init())
+                      return false;
+                  InitInputDevices();
+              }
+              isInitialized = true;
+              return true;
+          }
+
+          bool RenderDevice::SetupRendering()
+          {
+              if (!ios_gl_create()) {
+                  PrintLog(PRINT_NORMAL, "[iOS] EAGL context/framebuffer creation failed");
+                  return false;
+              }
+          ''' + s[b:]
+
+          # android-only jni call
+          s = re.sub(r"#if RETRO_PLATFORM == RETRO_ANDROID\n    auto\* jni = GetJNISetup\(\);.*?#endif\n", "", s, count=1, flags=re.S)
+
+          # ProcessEvents
+          a = s.index("bool RenderDevice::ProcessEvents()\n{")
+          b = s.index("\n}\n\nvoid RenderDevice::FlipScreen()", a)
+          s = s[:a] + '''bool RenderDevice::ProcessEvents()
+          {
+              // GL work in the background gets the app killed by iOS: drain, ack, and sleep until we are active again
+              if (!ios_is_active()) {
+                  glFinish();
+                  ios_ack_paused();
+                  while (!ios_is_active())
+                      usleep(20000);
+                  lastFrame = std::chrono::steady_clock::now();
+              }
+              return true;''' + s[b:]
+
+          # FlipScreen: skip while inactive
+          s = sub_once(s, "void RenderDevice::FlipScreen()\n{\n    if (!isInitialized)\n        return;",
+                          "void RenderDevice::FlipScreen()\n{\n    if (!isInitialized || !ios_is_active())\n        return;", "flipscreen")
+
+          # buffer swap
+          s, n = re.subn(r"#if RETRO_PLATFORM != RETRO_ANDROID\n    if \(!eglSwapBuffers.*?#endif\n\}\n\nvoid RenderDevice::Release",
+                          "    ios_gl_present();\n}\n\nvoid RenderDevice::Release", s, count=1, flags=re.S)
+          if n != 1: die("swap block")
+
+          # Release
+          s = sub_once(s, "if (display != EGL_NO_DISPLAY) {", "if (isInitialized) {", "release cond")
+          s, n = re.subn(r"        eglMakeCurrent\(display, EGL_NO_SURFACE.*?context = EGL_NO_CONTEXT;\n", "        ios_gl_destroy();\n", s, count=1, flags=re.S)
+          if n != 1: die("release egl block")
+
+          # GetWindowSize
+          a = s.index("void RenderDevice::GetWindowSize(int32 *width, int32 *height)\n{")
+          b = s.index("\n}\n", a)
+          s = s[:a] + '''void RenderDevice::GetWindowSize(int32 *width, int32 *height)
+          {
+              int w = 0, h = 0;
+              ios_gl_size(&w, &h);
+              if (width)
+                  *width = w;
+              if (height)
+                  *height = h;''' + s[b:]
+
+          # everything else that said "android" means "GLES2 phone": FPS cap, fsWidth defaults, precision probing
+          s = s.replace("RETRO_PLATFORM == RETRO_ANDROID", "RETRO_GLES_MOBILE")
+          s = "#define RETRO_GLES_MOBILE (1)\n#include <unistd.h>\n" + s
+          if re.search(r"egl|Swappy|ALooper|ANativeWindow|GetJNISetup", s):
+              print("WARNING: leftover EGL/Android references in IOSRenderDevice.cpp:")
+              for m in re.finditer(r".*(egl|Swappy|ALooper|ANativeWindow|GetJNISetup).*", s): print("   ", m.group(0).strip())
+          wr(os.path.join(RSDK, "Graphics/IOS/IOSRenderDevice.cpp"), s)
+
+          # ---------------------------------------------------------------- 3. engine hooks
+          p = os.path.join(RSDK, "Core/RetroEngine.hpp"); s = rd(p)
+          s = sub_once(s, "#define RETRO_RENDERDEVICE_PSP  (0)\n", "#define RETRO_RENDERDEVICE_PSP  (0)\n#define RETRO_RENDERDEVICE_IOS  (0)\n", "flag render", "RETRO_RENDERDEVICE_IOS")
+          s = sub_once(s, "#define RETRO_AUDIODEVICE_PSP  (0)\n", "#define RETRO_AUDIODEVICE_PSP  (0)\n#define RETRO_AUDIODEVICE_IOS  (0)\n", "flag audio", "RETRO_AUDIODEVICE_IOS")
+          s = sub_once(s, "#define RETRO_INPUTDEVICE_PSP    (0)\n", "#define RETRO_INPUTDEVICE_PSP    (0)\n#define RETRO_INPUTDEVICE_IOS    (0)\n", "flag input", "RETRO_INPUTDEVICE_IOS")
+          s = sub_once(s, "#elif RETRO_PLATFORM == RETRO_OSX || RETRO_PLATFORM == RETRO_iOS\n\n#undef RETRO_RENDERDEVICE_SDL2",
+          """#elif RETRO_PLATFORM == RETRO_iOS
+
+          #undef RETRO_RENDERDEVICE_IOS
+          #define RETRO_RENDERDEVICE_IOS (1)
+          #undef RETRO_AUDIODEVICE_IOS
+          #define RETRO_AUDIODEVICE_IOS (1)
+          #undef RETRO_INPUTDEVICE_IOS
+          #define RETRO_INPUTDEVICE_IOS (1)
+
+          #undef RETRO_INPUTDEVICE_KEYBOARD
+          #define RETRO_INPUTDEVICE_KEYBOARD (0)
+
+          #elif RETRO_PLATFORM == RETRO_OSX
+
+          #undef RETRO_RENDERDEVICE_SDL2""", "platform switch", "RETRO_RENDERDEVICE_IOS (1)")
+          s = sub_once(s, "#elif RETRO_PLATFORM == RETRO_iOS\n\n#include \"cocoaHelpers.hpp\"", "#elif RETRO_PLATFORM == RETRO_iOS\n\n#include <unistd.h>", "cocoaHelpers", "#include <unistd.h>\n#elif RETRO_PLATFORM == RETRO_LINUX")
+          wr(p, s)
+
+          def hook(rel, old, new, what, marker):
+              p = os.path.join(RSDK, rel); s = rd(p); wr(p, sub_once(s, old, new, what, marker))
+
+          hook("Graphics/Drawing.hpp", '#elif RETRO_RENDERDEVICE_PSP\n#include "PSP/PSPRenderDevice.hpp"', '#elif RETRO_RENDERDEVICE_IOS\n#include "IOS/IOSRenderDevice.hpp"\n#elif RETRO_RENDERDEVICE_PSP\n#include "PSP/PSPRenderDevice.hpp"', "drawing.hpp", "IOSRenderDevice.hpp")
+          hook("Graphics/Drawing.cpp", '#elif RETRO_RENDERDEVICE_PSP\n#include "PSP/PSPRenderDevice.cpp"', '#elif RETRO_RENDERDEVICE_IOS\n#include "IOS/IOSRenderDevice.cpp"\n#elif RETRO_RENDERDEVICE_PSP\n#include "PSP/PSPRenderDevice.cpp"', "drawing.cpp", "IOSRenderDevice.cpp")
+          hook("Audio/Audio.hpp", '#elif RETRO_AUDIODEVICE_PSP\n#include "PSP/PSPAudioDevice.hpp"', '#elif RETRO_AUDIODEVICE_IOS\n#include "IOS/IOSAudioDevice.hpp"\n#elif RETRO_AUDIODEVICE_PSP\n#include "PSP/PSPAudioDevice.hpp"', "audio.hpp", "IOSAudioDevice.hpp")
+          hook("Audio/Audio.cpp", '#elif RETRO_AUDIODEVICE_PSP\n#include "PSP/PSPAudioDevice.cpp"', '#elif RETRO_AUDIODEVICE_IOS\n#include "IOS/IOSAudioDevice.cpp"\n#elif RETRO_AUDIODEVICE_PSP\n#include "PSP/PSPAudioDevice.cpp"', "audio.cpp", "IOSAudioDevice.cpp")
+          hook("Input/Input.hpp", '#if RETRO_INPUTDEVICE_PSP\n#include "PSP/PSPInputDevice.hpp"\n#endif', '#if RETRO_INPUTDEVICE_PSP\n#include "PSP/PSPInputDevice.hpp"\n#endif\n\n#if RETRO_INPUTDEVICE_IOS\n#include "IOS/IOSInputDevice.hpp"\n#endif', "input.hpp", "IOSInputDevice.hpp")
+          hook("Input/Input.cpp", '#if RETRO_INPUTDEVICE_PSP\n#include "PSP/PSPInputDevice.cpp"\n#endif', '#if RETRO_INPUTDEVICE_PSP\n#include "PSP/PSPInputDevice.cpp"\n#endif\n\n#if RETRO_INPUTDEVICE_IOS\n#include "IOS/IOSInputDevice.cpp"\n#endif', "input.cpp inc", "IOSInputDevice.cpp")
+          hook("Input/Input.cpp", '#if RETRO_INPUTDEVICE_PSP\n    SKU::InitPSPInputAPI();\n#endif', '#if RETRO_INPUTDEVICE_PSP\n    SKU::InitPSPInputAPI();\n#endif\n\n#if RETRO_INPUTDEVICE_IOS\n    SKU::InitIOSInputAPI();\n#endif', "input.cpp init", "InitIOSInputAPI")
+
+          p = os.path.join(ENG, "main.cpp"); s = rd(p)
+          s = sub_once(s, "#else\nint32 main(int32 argc, char *argv[]) { return RSDK_main(argc, argv, (void *)LinkGameLogic); }",
+          "#elif RETRO_PLATFORM == RETRO_iOS\n// main() lives in ios/IOSBridge.mm (UIApplicationMain); it starts the engine thread, which lands here\nextern \"C\" int32 ios_engine_entry(int32 argc, char **argv) { return RSDK_main(argc, argv, (void *)LinkGameLogic); }\n#else\nint32 main(int32 argc, char *argv[]) { return RSDK_main(argc, argv, (void *)LinkGameLogic); }", "main.cpp", "ios_engine_entry")
+          wr(p, s)
+          print("iOS port applied.")
+          EOF_SMPORT
+          mkdir -p "$(dirname 'Makefile.ios')"
+          cat > 'Makefile.ios' <<'EOF_SMPORT'
+          # Sonic Mania (RSDKv5 decompilation) for iOS 7.0+ / armv7 (32-bit), built with Theos + the iPhoneOS 9.3 SDK.
+          #   python3 tools/apply_ios_port.py      # once: patches the engine tree
+          #   make -f Makefile.ios package FINALPACKAGE=1
+          ARCHS  = armv7
+          TARGET = iphone:clang:9.3:7.0
+          DEBUG  = 0
+
+          include $(THEOS)/makefiles/common.mk
+
+          DECOMP = SonicManiaDecomp
+          RSDK   = $(DECOMP)/dependencies/RSDKv5
+          ENG    = $(RSDK)/RSDKv5
+          DEPS   = $(RSDK)/dependencies/all
+          GAME   = $(DECOMP)/SonicMania
+
+          # same translation units as the PSP build (psp/Makefile); Drawing/Audio/Input pull in the IOS backends via #include
+          ENGINE_SRCS = \
+          	$(ENG)/main.cpp \
+          	$(ENG)/RSDK/Core/RetroEngine.cpp $(ENG)/RSDK/Core/Math.cpp $(ENG)/RSDK/Core/Reader.cpp $(ENG)/RSDK/Core/Link.cpp \
+          	$(ENG)/RSDK/Dev/Debug.cpp \
+          	$(ENG)/RSDK/Storage/Storage.cpp $(ENG)/RSDK/Storage/Text.cpp \
+          	$(ENG)/RSDK/Graphics/Drawing.cpp $(ENG)/RSDK/Graphics/Scene3D.cpp $(ENG)/RSDK/Graphics/Animation.cpp \
+          	$(ENG)/RSDK/Graphics/Sprite.cpp $(ENG)/RSDK/Graphics/Palette.cpp $(ENG)/RSDK/Graphics/Video.cpp \
+          	$(ENG)/RSDK/Audio/Audio.cpp $(ENG)/RSDK/Input/Input.cpp \
+          	$(ENG)/RSDK/Scene/Scene.cpp $(ENG)/RSDK/Scene/Collision.cpp $(ENG)/RSDK/Scene/Object.cpp \
+          	$(ENG)/RSDK/Scene/Objects/DefaultObject.cpp $(ENG)/RSDK/Scene/Objects/DevOutput.cpp \
+          	$(ENG)/RSDK/User/Core/UserAchievements.cpp $(ENG)/RSDK/User/Core/UserCore.cpp $(ENG)/RSDK/User/Core/UserLeaderboards.cpp \
+          	$(ENG)/RSDK/User/Core/UserPresence.cpp $(ENG)/RSDK/User/Core/UserStats.cpp $(ENG)/RSDK/User/Core/UserStorage.cpp \
+          	$(DEPS)/tinyxml2/tinyxml2.cpp $(DEPS)/iniparser/iniparser.cpp $(DEPS)/iniparser/dictionary.cpp
+          ENGINE_CSRCS = $(DEPS)/miniz/miniz.c
+          GAME_CSRCS   = $(GAME)/Game.c $(GAME)/Objects/All.c
+
+          # MANIA_PREPLUS=0 -> Plus content (Encore, Mighty, Ray) enabled; build it only from your own copy of the game.
+          DEFS = -DRETRO_REVISION=2 -DRETRO_USE_MOD_LOADER=0 -DRETRO_STANDALONE=0 -DRETRO_DISABLE_LOG=0 \
+                 -DGAME_INCLUDE_EDITOR=0 -DMANIA_PREPLUS=0 -DGAME_VERSION=6 -DRSDK_AUTOBUILD=0 \
+                 -DRETRO_DEV_EXTRA=\"iOS7\" -DMINIZ_NO_TIME -DTINYXML2_NO_EXCEPTIONS
+
+          INCS = -Iios -I$(ENG) -I$(ENG)/RSDK -I$(DEPS) -I$(DEPS)/tinyxml2 -I$(DEPS)/iniparser -I$(GAME) -I$(GAME)/Objects
+
+          WARN = -Wno-unused -Wno-sign-compare -Wno-format -Wno-narrowing -Wno-c++11-narrowing -Wno-write-strings \
+                 -Wno-deprecated-declarations -Wno-everything
+
+          APPLICATION_NAME = SonicMania
+          SonicMania_FILES = ios/IOSBridge.mm $(ENGINE_SRCS) $(ENGINE_CSRCS) $(GAME_CSRCS)
+          SonicMania_CFLAGS   = -O2 -fno-strict-aliasing -ffast-math -marm -mfpu=neon -mfloat-abi=softfp $(DEFS) $(INCS) $(WARN)
+          SonicMania_CXXFLAGS = -std=gnu++14 -fno-exceptions -fno-rtti
+          SonicMania_OBJCFLAGS = -fno-objc-arc
+          SonicMania_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore OpenGLES AudioToolbox AVFoundation
+          SonicMania_CODESIGN_FLAGS = -Sent.plist
+
+          include $(THEOS_MAKE_PATH)/application.mk
+          EOF_SMPORT
+          mkdir -p "$(dirname 'Info.plist')"
+          cat > 'Info.plist' <<'EOF_SMPORT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDisplayName</key><string>Sonic Mania</string>
+              <key>CFBundleName</key><string>SonicMania</string>
+              <key>CFBundleIdentifier</key><string>com.example.sonicmania.ios7</string>
+              <key>CFBundleExecutable</key><string>SonicMania</string>
+              <key>CFBundleVersion</key><string>1</string>
+              <key>CFBundleShortVersionString</key><string>0.1.0</string>
+              <key>CFBundlePackageType</key><string>APPL</string>
+              <key>LSRequiresIPhoneOS</key><true/>
+              <key>MinimumOSVersion</key><string>7.0</string>
+              <key>UIRequiredDeviceCapabilities</key>
+              <array><string>armv7</string><string>opengles-2</string></array>
+              <key>UISupportedInterfaceOrientations</key>
+              <array><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+              <key>UIStatusBarHidden</key><true/>
+              <key>UIViewControllerBasedStatusBarAppearance</key><false/>
+              <key>UIFileSharingEnabled</key><true/>
+              <key>UIPrerenderedIcon</key><true/>
+          </dict>
+          </plist>
+          EOF_SMPORT
+          mkdir -p "$(dirname 'ent.plist')"
+          cat > 'ent.plist' <<'EOF_SMPORT'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict/></plist>
+          EOF_SMPORT
+          mkdir -p "$(dirname 'control')"
+          cat > 'control' <<'EOF_SMPORT'
+          Package: com.example.sonicmania.ios7
+          Name: Sonic Mania
+          Version: 0.1.0
+          Architecture: iphoneos-arm
+          Description: Sonic Mania (RSDKv5 decompilation) for iOS 7, armv7
+          Maintainer: you
+          Section: Games
+          EOF_SMPORT
+      - name: Patch engine for iOS
+        run: python3 tools/apply_ios_port.py
+      - name: Theos + toolchain
+        run: |
+          set -euo pipefail
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/toolchain/linux/iphone"
+          curl -fsSL "https://github.com/L1ghtmann/llvm-project/releases/download/main-update_3-eabca92/iOSToolchain-x86_64.tar.xz" -o /tmp/tc.tar.xz
+          tar -xf /tmp/tc.tar.xz -C "$THEOS/toolchain"
+      - name: iPhoneOS 9.3 SDK
+        run: |
+          set -euo pipefail
+          mkdir -p "$THEOS/sdks"
+          curl -fsSL -o /tmp/sdk.tbz2 "https://raw.githubusercontent.com/Sn0wCooder/theos-sdks/master/iPhoneOS9.3.sdk.tbz2"
+          tar -xjf /tmp/sdk.tbz2 -C "$THEOS/sdks"
+          SDK="$THEOS/sdks/iPhoneOS9.3.sdk"
+          for fw in "$SDK"/System/Library/Frameworks/*.framework; do
+            if [ -f "$fw/module.map" ]; then mkdir -p "$fw/Modules"; mv "$fw/module.map" "$fw/Modules/module.modulemap"; fi
+          done
+          find "$SDK/usr/include" -name module.map | while read -r m; do mv "$m" "$(dirname "$m")/module.modulemap"; done
+      - name: Build
+        run: make -f Makefile.ios package FINALPACKAGE=1 V=1 2>&1 | tee build.log
+      - name: Pack .ipa
+        run: |
+          set -euo pipefail
+          APP="$(find .theos -type d -name SonicMania.app | head -n1)"
+          [ -n "$APP" ] || { echo "::error::SonicMania.app not found"; exit 1; }
+          mkdir -p ipa/Payload packages && cp -a "$APP" ipa/Payload/
+          (cd ipa && zip -rq ../packages/SonicMania-armv7-ios7.ipa Payload)
+      - name: Check Mach-O is armv7
+        run: |
+          BIN="$(find .theos -type f -name SonicMania | head -n1)"; file "$BIN"
+          file "$BIN" | grep -qi "armv7" || { echo "::error::not an armv7 binary"; exit 1; }
+      - uses: actions/upload-artifact@v4
+        with: { name: SonicMania-armv7-ios7, path: "packages/*.ipa", if-no-files-found: error }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: build-log, path: build.log, if-no-files-found: ignore }
